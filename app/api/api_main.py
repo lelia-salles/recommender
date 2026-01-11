@@ -3,7 +3,7 @@ import os
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 # Imports dos módulos do projeto
@@ -37,10 +37,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 def get_db_connection():
     """Conecta ao banco PostgreSQL com encoding UTF-8."""
     return psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        database=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASS"),
+        host=os.getenv("DB_HOST", "localhost"),
+        database=os.getenv("DB_NAME", "recommender_db"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASS", "password"),
         client_encoding='utf-8'
     )
 
@@ -71,15 +71,17 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     Compatível com o botão 'Authorize' do Swagger.
     Recebe 'username' e 'password' via Form-Data.
     """
-    conn = get_db_connection()
+    conn = None  # Inicializa como None para evitar erro no finally
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
-            # Busca o hash da senha no banco
-            cur.execute("SELECT password_hash FROM users WHERE username = %s", (form_data.username,))
+            # Busca o hash da senha no banco (schema public explícito)
+            cur.execute("SELECT password_hash FROM public.users WHERE username = %s", (form_data.username,))
             result = cur.fetchone()
 
         # Verifica se o usuário existe e se a senha bate com o hash
         if not result or not verify_password(form_data.password, result[0]):
+            # Retorna 400 (Bad Request) para senha errada
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Usuário ou senha incorretos"
@@ -89,10 +91,15 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         access_token = create_access_token(data={"sub": form_data.username})
         return {"access_token": access_token, "token_type": "bearer"}
 
+    except HTTPException as he:
+        # Se for erro de senha (400) ou Auth (401), relança para o usuário ver
+        raise he
     except Exception as e:
-        print(f"Erro no login: {e}")
+        # Se for erro de banco ou código, loga no terminal e dá erro 500
+        print(f"Erro CRÍTICO no login: {e}")
         raise HTTPException(status_code=500, detail="Erro interno no servidor")
     finally:
+        # Só tenta fechar se a conexão foi aberta com sucesso
         if conn:
             conn.close()
 
@@ -106,7 +113,8 @@ def get_recommendations(current_user: str = Depends(get_current_user)):
     print(f"Gerando recomendações para: {current_user}")
 
     try:
-        # Chama o serviço de recomendação (que usa a query recursiva SQL)
+        # Chama o serviço de recomendação
+        # O serviço recommender.py já gerencia sua própria conexão com banco
         raw_recs = recommend(current_user, limit=5, depth=3)
 
         # Converte a resposta (Tuplas) para o formato JSON esperado
