@@ -2,118 +2,66 @@ import os
 import psycopg2
 from typing import List, Tuple, Dict, Any
 from dotenv import load_dotenv
-
-# Carrega as variáveis do arquivo .env
-load_dotenv()
-
-# Configurações do Banco de Dados
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "recommender_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "password")
+from collections import deque, defaultdict
 
 
-def get_db_connection():
-    """
-    Estabelece conexão com o PostgreSQL.
-    Define client_encoding='utf-8' para evitar erros com senhas/caracteres especiais.
-    """
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-        client_encoding='utf-8'
-    )
-    return conn
+# 1. Estrutura básica do Grafo
+class Graph:
+    def __init__(self):
+        self.adj_list = defaultdict(list)
+        self.nodes = {}  # Armazena metadados: {"U1": {"type": "user"}, "P1": {"type": "product"}}
+
+    def add_node(self, node_id, node_type):
+        self.nodes[node_id] = {"type": node_type}
+
+    def add_edge(self, u, v):
+        # Grafo não direcionado (se U1 comprou P1, P1 foi comprado por U1)
+        self.adj_list[u].append(v)
+        self.adj_list[v].append(u)
 
 
-def recommend(user_id: str, limit: int = 5, depth: int = 3, config: Dict[str, Any] = None) -> List[Tuple[str, float]]:
-    """
-    Gera recomendações usando Recursive CTE (Common Table Expression) no PostgreSQL.
-    Isso substitui o grafo em memória, permitindo escalar para milhões de dados.
+# 2. A Classe Wrapper que o erro estava reclamando
+class HybridRecommender:
+    def __init__(self):
+        self.graph = Graph()
 
-    Args:
-        user_id: ID do utilizador (nó de origem).
-        limit: Quantidade máxima de itens a retornar.
-        depth: Profundidade da busca no grafo (vizinhos dos vizinhos).
-        config: Dicionário opcional para sobrescrever limit/depth.
+    def recommend(self, user_id, top_n=3):
+        """
+        Lógica de recomendação baseada em vizinhos (Quem comprou isso, também comprou...)
+        """
+        if user_id not in self.graph.adj_list:
+            return []
 
-    Returns:
-        Lista de tuplas: [('PRODUTO_X', 2.5), ('PRODUTO_Y', 1.2), ...]
-    """
+        # Itens que o usuário JÁ comprou (para não recomendar de novo)
+        purchased_items = set(self.graph.adj_list[user_id])
 
-    # Permite sobrescrever configurações via dicionário
-    if config:
-        limit = config.get("limit", limit)
-        depth = config.get("depth", depth)
+        # Pontuação de recomendação
+        scores = defaultdict(int)
 
-    conn = get_db_connection()
-    results = []
+        # Passo 1: Achar produtos comprados pelo usuário alvo
+        # (user_id) -> [P1, P2]
+        user_products = self.graph.adj_list[user_id]
 
-    try:
-        with conn.cursor() as cur:
-            # Query otimizada com schema 'public.' explícito
-            # O uso de %s é obrigatório para evitar SQL Injection via psycopg2
-            # noinspection SqlNoDataSourceInspection,SqlResolve
-            query = """
-                        WITH RECURSIVE graph_traversal AS (
-                            -- 1. Caso Base: Vizinhos diretos (Nível 1)
-                            SELECT 
-                                t1.target_id, 
-                                t1.weight, 
-                                1 as current_depth
-                            FROM public.interactions t1
-                            WHERE t1.source_id = %s
+        for product in user_products:
+            # Passo 2: Achar outros usuários que compraram esses mesmos produtos
+            # (P1) -> [U2, U3]
+            similar_users = self.graph.adj_list[product]
 
-                            UNION ALL
+            for other_user in similar_users:
+                if other_user == user_id:
+                    continue  # Pula o próprio usuário
 
-                            -- 2. Passo Recursivo: Vizinhos dos vizinhos (Nível N)
-                            SELECT 
-                                i.target_id, 
-                                i.weight, 
-                                gt.current_depth + 1
-                            FROM public.interactions i
-                            INNER JOIN graph_traversal gt ON i.source_id = gt.target_id
-                            WHERE gt.current_depth < %s
-                        )
+                # Passo 3: Achar produtos que esses "outros usuários" compraram
+                # (U2) -> [P3, P4]
+                other_user_products = self.graph.adj_list[other_user]
 
-                        -- 3. Agregação e Cálculo do Score Final
-                        SELECT 
-                            gt_final.target_id, 
-                            SUM(gt_final.weight / (gt_final.current_depth + 1)) as score
-                        FROM graph_traversal gt_final
+                for potential_recommendation in other_user_products:
+                    # Só recomenda se for PRODUTO e se o usuário alvo AINDA NÃO comprou
+                    if (self.graph.nodes.get(potential_recommendation, {}).get("type") == "product" and
+                            potential_recommendation not in purchased_items):
+                        # Aumenta o score (quanto mais gente comprou, melhor)
+                        scores[potential_recommendation] += 1
 
-                        -- Filtros:
-                        WHERE gt_final.target_id != %s -- Não recomendar o próprio usuário
-                          AND gt_final.target_id NOT IN (
-                            -- Não recomendar itens com os quais o usuário JÁ interagiu diretamente
-                            SELECT existing.target_id
-                            FROM public.interactions existing
-                            WHERE existing.source_id = %s
-                        )
-                        GROUP BY gt_final.target_id
-                        ORDER BY score DESC
-                        LIMIT %s;
-                        """
-
-            # Parâmetros na ordem exata dos %s:
-            # 1. source_id (Caso Base)
-            # 2. max_depth (Limite Recursão)
-            # 3. user_id (Filtro != self)
-            # 4. user_id (Subquery NOT IN)
-            # 5. limit (Resultado final)
-            params = (user_id, depth, user_id, user_id, limit)
-
-            cur.execute(query, params)
-            results = cur.fetchall()
-
-    except Exception as e:
-        print(f"Erro ao gerar recomendações no banco de dados: {e}")
-        # Em produção, aqui você usaria um logger (ex: logging.error(e))
-
-    finally:
-        if conn:
-            conn.close()
-
-    return results
+        # Ordenar pelos mais recomendados
+        sorted_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [item for item, score in sorted_recs[:top_n]]
