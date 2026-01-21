@@ -1,67 +1,82 @@
-import os
-import psycopg2
-from typing import List, Tuple, Dict, Any
-from dotenv import load_dotenv
 from collections import deque, defaultdict
 
 
-# 1. Estrutura básica do Grafo
 class Graph:
     def __init__(self):
         self.adj_list = defaultdict(list)
-        self.nodes = {}  # Armazena metadados: {"U1": {"type": "user"}, "P1": {"type": "product"}}
+        self.nodes = {}  # Armazena metadados: {"NodeA": {"type": "city", "data": {...}}}
 
-    def add_node(self, node_id, node_type):
-        self.nodes[node_id] = {"type": node_type}
+    def add_node(self, node_id, node_type, **kwargs):
+        self.nodes[node_id] = {"type": node_type, "properties": kwargs}
 
-    def add_edge(self, u, v):
-        # Grafo não direcionado (se U1 comprou P1, P1 foi comprado por U1)
+    def add_edge(self, u, v, weight=1):
+        # Grafo não direcionado (A conexão vale para os dois lados)
         self.adj_list[u].append(v)
         self.adj_list[v].append(u)
 
+    def clear(self):
+        self.adj_list = defaultdict(list)
+        self.nodes = {}
 
-# 2. A Classe Wrapper que o erro estava reclamando
-class HybridRecommender:
+
+class GenericRecommender:
     def __init__(self):
         self.graph = Graph()
 
-    def recommend(self, user_id, top_n=3):
+    def load_data(self, data: dict):
         """
-        Lógica de recomendação baseada em vizinhos (Quem comprou isso, também comprou...)
+        Recebe um JSON completo com nós e arestas e popula o grafo.
+        Estrutura esperada:
+        {
+            "nodes": [{"id": "SP", "type": "cidade"}, ...],
+            "edges": [{"source": "Joao", "target": "SP"}, ...]
+        }
         """
-        if user_id not in self.graph.adj_list:
+        self.graph.clear()  # Limpa dados antigos
+
+        for node in data.get("nodes", []):
+            self.graph.add_node(node["id"], node["type"])
+
+        for edge in data.get("edges", []):
+            self.graph.add_edge(edge["source"], edge["target"])
+
+        return len(self.graph.nodes), len(data.get("edges", []))
+
+    def recommend(self, entity_id, target_type=None, top_n=3):
+        """
+        Recomenda entidades conectadas indiretamente.
+        entity_id: O ponto de partida (ex: O Músico, ou um Fã)
+        target_type: O tipo de coisa que queremos recomendar (ex: "cidade", "vaga")
+        """
+        if entity_id not in self.graph.adj_list:
             return []
 
-        # Itens que o usuário JÁ comprou (para não recomendar de novo)
-        purchased_items = set(self.graph.adj_list[user_id])
+        # Itens já conectados diretamente (para não recomendar o óbvio)
+        connected_items = set(self.graph.adj_list[entity_id])
 
-        # Pontuação de recomendação
         scores = defaultdict(int)
 
-        # Passo 1: Achar produtos comprados pelo usuário alvo
-        # (user_id) -> [P1, P2]
-        user_products = self.graph.adj_list[user_id]
+        # Lógica de Collaborative Filtering Genérica (Vizinho do Vizinho)
+        # Passo 1: Quem/O que está conectado a mim?
+        direct_neighbors = self.graph.adj_list[entity_id]
 
-        for product in user_products:
-            # Passo 2: Achar outros usuários que compraram esses mesmos produtos
-            # (P1) -> [U2, U3]
-            similar_users = self.graph.adj_list[product]
+        for neighbor in direct_neighbors:
+            # Passo 2: O que está conectado aos meus vizinhos?
+            neighbor_connections = self.graph.adj_list[neighbor]
 
-            for other_user in similar_users:
-                if other_user == user_id:
-                    continue  # Pula o próprio usuário
+            for candidate in neighbor_connections:
+                if candidate == entity_id: continue
+                if candidate in connected_items: continue
 
-                # Passo 3: Achar produtos que esses "outros usuários" compraram
-                # (U2) -> [P3, P4]
-                other_user_products = self.graph.adj_list[other_user]
+                # Passo 3: Filtrar pelo TIPO desejado (se especificado)
+                # Ex: Se João quer saber CIDADES, ignoramos outros MÚSICOS.
+                candidate_type = self.graph.nodes.get(candidate, {}).get("type")
 
-                for potential_recommendation in other_user_products:
-                    # Só recomenda se for PRODUTO e se o usuário alvo AINDA NÃO comprou
-                    if (self.graph.nodes.get(potential_recommendation, {}).get("type") == "product" and
-                            potential_recommendation not in purchased_items):
-                        # Aumenta o score (quanto mais gente comprou, melhor)
-                        scores[potential_recommendation] += 1
+                if target_type and candidate_type != target_type:
+                    continue
 
-        # Ordenar pelos mais recomendados
+                scores[candidate] += 1
+
+        # Ordenar e retornar
         sorted_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [item for item, score in sorted_recs[:top_n]]
