@@ -1,1 +1,14 @@
-t
+fastapi
+uvicorn
+python-dotenv
+psycopg2-binary
+networkx
+pandas
+scikit-learn
+numpy
+bcrypt
+python-jose[cryptography]
+streamlit
+pyvis
+requests
+python-multipart
