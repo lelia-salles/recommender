@@ -5,6 +5,8 @@ import networkx as nx
 import joblib
 from collections import deque
 from dotenv import load_dotenv
+# Certifique-se que o lsh_service.py foi criado no passo anterior
+from app.services.lsh_service import MinHashLSH
 
 load_dotenv()
 
@@ -22,11 +24,12 @@ class HybridRecommender:
     def __init__(self):
         self.graph = nx.Graph()
         self.model_artifacts = None
-        print("--- INICIALIZANDO RECOMENDADOR HÍBRIDO ---")
+        # Inicializa LSH com threshold 0.2 para testes (pega vizinhos com 20% de similaridade)
+        self.lsh = MinHashLSH(threshold=0.2)
+        print("--- INICIALIZANDO RECOMENDADOR HÍBRIDO + LSH ---")
         self._load_resources()
 
     def _load_resources(self):
-        """Carrega dados do Postgres e Modelo ML ao iniciar."""
         try:
             print(f"1. Conectando no banco: {DB_PARAMS['database']}...")
             conn = psycopg2.connect(**DB_PARAMS)
@@ -40,6 +43,16 @@ class HybridRecommender:
 
             if df.empty:
                 print("!!! ALERTA: O BANCO PARECE VAZIO. O GRAFO INICIARÁ VAZIO. !!!")
+            else:
+                # --- [NOVO BLOCO LSH] ---
+                print("   > Populando índice LSH...")
+                # Agrupa interações por usuário: {'U1': {'ItemA', 'ItemB'}, ...}
+                user_items = df.groupby('source_id')['target_id'].apply(set).to_dict()
+
+                for user, items in user_items.items():
+                    self.lsh.add_user(user, items)
+                print(f"   > LSH indexado com {len(user_items)} usuários.")
+                # ------------------------
 
             # Cria o grafo NetworkX
             self.graph = nx.from_pandas_edgelist(
@@ -59,8 +72,7 @@ class HybridRecommender:
 
     def ingest_data(self, graph_data: dict):
         """
-        [NOVO] Recebe dados do Parser e salva no PostgreSQL.
-        Formato esperado: {'edges': [{'source': 'A', 'target': 'B'}], ...}
+        Recebe dados do Parser e salva no PostgreSQL.
         """
         edges = graph_data.get("edges", [])
         if not edges:
@@ -78,24 +90,23 @@ class HybridRecommender:
                 src = edge.get("source")
                 tgt = edge.get("target")
 
-                # Ignora dados inválidos
                 if not src or not tgt: continue
 
-                # SQL de Inserção (Ida e Volta para garantir grafo não-direcionado no banco)
-                # Usamos ON CONFLICT para não dar erro se já existir
                 insert_query = """
-                    INSERT INTO public.interactions (source_id, target_id, weight, interaction_type)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (source_id, target_id, interaction_type) DO NOTHING;
-                """
+                               INSERT INTO public.interactions (source_id, target_id, weight, interaction_type)
+                               VALUES (%s, %s, %s, %s)
+                               ON CONFLICT (source_id, target_id, interaction_type) DO NOTHING; \
+                               """
 
-                # Inserir A -> B
                 cur.execute(insert_query, (src, tgt, 1.0, "upload_file"))
-                # Inserir B -> A (Reforço)
                 cur.execute(insert_query, (tgt, src, 1.0, "upload_file_reverse"))
 
-                # Atualiza também a memória RAM (para uso imediato)
+                # Atualiza memória RAM e LSH
                 self.graph.add_edge(src, tgt, weight=1.0)
+
+                # Nota: Para atualizar o LSH em tempo real seria necessário recalcular a assinatura do usuário.
+                # Por simplicidade, o LSH é atualizado apenas no reinício do servidor ou se chamarmos _load_resources.
+
                 saved_count += 1
 
             conn.commit()
@@ -111,7 +122,6 @@ class HybridRecommender:
             if conn: conn.close()
 
     def bfs_traversal(self, start_node, limit=20):
-        # (Lógica mantida igual ao arquivo original)
         if start_node not in self.graph: return set()
         visited = {start_node}
         queue = deque([(start_node, 0)])
@@ -122,13 +132,12 @@ class HybridRecommender:
             for neighbor in self.graph.neighbors(curr):
                 if neighbor not in visited:
                     visited.add(neighbor)
-                    if not neighbor.startswith('U'):  # Filtro simples de usuário
+                    if not neighbor.startswith('U'):
                         candidates.add(neighbor)
                     queue.append((neighbor, depth + 1))
         return candidates
 
     def dfs_traversal(self, start_node, max_depth=3, limit=20):
-        # (Lógica mantida igual ao arquivo original)
         if start_node not in self.graph: return set()
         visited = {start_node}
         stack = [(start_node, 0)]
@@ -144,13 +153,44 @@ class HybridRecommender:
                     stack.append((neighbor, depth + 1))
         return candidates
 
+    def lsh_traversal(self, user_id, limit=20):
+        """
+        Estratégia LSH: Encontra usuários globais similares e sugere o que eles compraram.
+        """
+        print(f"   > [LSH] Buscando sósias de {user_id}...")
+        # Chama o serviço LSH que criamos
+        similar_users = self.lsh.find_similar_users(user_id)
+
+        candidates = set()
+
+        # Pega os Top 5 usuários mais parecidos
+        for other_user, score in similar_users[:5]:
+            print(f"     - Vizinho LSH encontrado: {other_user} (Score: {score:.2f})")
+
+            # Pega itens desse vizinho no Grafo
+            if other_user in self.graph:
+                neighbors = self.graph.neighbors(other_user)
+                for item in neighbors:
+                    if not item.startswith('U'):
+                        candidates.add(item)
+
+            if len(candidates) >= limit:
+                break
+
+        return candidates
+
     def get_recommendations(self, user_id, top_k=5):
-        # 1. Busca Candidatos (Graph Traversal)
+        print(f"\n--- PROCESSANDO RECOMENDAÇÃO PARA {user_id} ---")
+
+        # 1. Busca Multi-Estratégia (BFS + DFS + LSH)
         candidates_bfs = self.bfs_traversal(user_id)
         candidates_dfs = self.dfs_traversal(user_id)
-        candidates = list(candidates_bfs.union(candidates_dfs))
+        candidates_lsh = self.lsh_traversal(user_id)
 
-        # 2. Filtra itens já consumidos
+        # Une todos os candidatos (Set garante unicidade)
+        candidates = list(candidates_bfs.union(candidates_dfs).union(candidates_lsh))
+
+        # 2. Filtro: Remove o que o usuário já consumiu
         if user_id in self.graph:
             interacted = set(self.graph.neighbors(user_id))
             candidates = [c for c in candidates if c not in interacted]
@@ -158,7 +198,7 @@ class HybridRecommender:
         if not candidates:
             return []
 
-        # 3. Ranking com ML (se disponível)
+        # 3. Ranking ML
         if self.model_artifacts:
             try:
                 model = self.model_artifacts["model"]
@@ -169,18 +209,16 @@ class HybridRecommender:
                 valid_candidates = []
 
                 for item in candidates:
-                    # Se o item é novo (acabou de ser upado), ele não tem pagerank calculado ainda.
-                    # Usamos 0 como default seguro.
                     pr_val = pagerank.get(item, 0)
                     deg_val = degree.get(item, 0)
                     features.append([pr_val, deg_val])
                     valid_candidates.append(item)
 
-                scores = model.predict(features)
-                results = sorted(zip(valid_candidates, scores), key=lambda x: x[1], reverse=True)
-                return results[:top_k]
+                if valid_candidates:
+                    scores = model.predict(features)
+                    results = sorted(zip(valid_candidates, scores), key=lambda x: x[1], reverse=True)
+                    return results[:top_k]
             except Exception as e:
                 print(f"Erro no ML Ranking: {e}. Retornando ordem padrão.")
 
-        # Fallback se não tiver ML
         return [(c, 1.0) for c in candidates[:top_k]]
