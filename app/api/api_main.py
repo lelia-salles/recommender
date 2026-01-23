@@ -1,19 +1,29 @@
+import os
+import psycopg2
+
 from fastapi import FastAPI, Depends, HTTPException, status, Body, UploadFile, File
 from fastapi.security import OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
 from typing import Optional, List
+from pydantic import BaseModel
 
-# --- IMPORTS DOS SERVIÇOS ---
+
 from app.services.auth import get_current_user, create_access_token
-# [MUDANÇA 1] Importando o motor Híbrido em vez do Genérico
+from app.core.security import get_password_hash, hash_sensitive_data
 from app.services.hybrid_recommender import HybridRecommender
 from app.services.parser import FileParser
 
 # --- INICIALIZAÇÃO DOS SERVIÇOS ---
-# [MUDANÇA 2] Inicializa o Híbrido (ele conecta no Postgres e carrega o modelo .pkl automaticamente)
+# Conectando no Postgres e carrega o modelo .pkl automaticamente
 recommender = HybridRecommender()
 parser = FileParser()
 
+# --- MODELO DE DADOS PARA REGISTRO ---
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    email: str
+    cpf: str  # Dado sensível (será hashado)
 
 # --- LIFESPAN (Ciclo de Vida) ---
 @asynccontextmanager
@@ -40,6 +50,57 @@ app = FastAPI(
 
 
 # ==========================================
+# 0. ROTA DE REGISTRO (NOVA)
+# ==========================================
+@app.post("/register", status_code=201)
+async def register(user: UserCreate):
+    """
+    Cadastra usuário protegendo os dados sensíveis.
+    Preenche o campo 'email' legado com uma máscara.
+    """
+    conn = None
+    try:
+        # 1. Criptografia
+        pwd_hash = get_password_hash(user.password)
+        email_hash = hash_sensitive_data(user.email)
+        cpf_hash = hash_sensitive_data(user.cpf)
+
+        # 2. Máscara para o campo legado (NOT NULL)
+        # Cria algo como: protegido_a7f9...@system.local
+        # Isso garante unicidade se o banco exigir UNIQUE no email
+        email_mask = f"protegido_{email_hash[:8]}@system.local"
+
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            database=os.getenv("DB_NAME", "recommender"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASS", "password")
+        )
+        cur = conn.cursor()
+
+        # 3. Inserção (Incluindo o campo 'email' com a máscara)
+        query = """
+                INSERT INTO public.users
+                    (username, email, password_hash, email_hash, sensitive_data_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING username; \
+                """
+        cur.execute(query, (user.username, email_mask, pwd_hash, email_hash, cpf_hash))
+
+        conn.commit()
+        cur.close()
+
+        return {"msg": f"Usuário {user.username} criado com sucesso. Email real ocultado."}
+
+    except psycopg2.errors.UniqueViolation:
+        raise HTTPException(status_code=400, detail="Usuário ou dados já cadastrados.")
+    except Exception as e:
+        print(f"Erro no registro: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno.")
+    finally:
+        if conn: conn.close()
+
+# ==========================================
 # 1. ROTA DE AUTENTICAÇÃO (Login)
 # ==========================================
 @app.post("/login")
@@ -56,9 +117,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 # ==========================================
 # 2. ROTAS DE INGESTÃO (Upload -> Banco)
 # ==========================================
-# Nota: O Item 2 (Salvar no Banco) será implementado no próximo passo.
-# Por enquanto, mantivemos a rota recebendo o arquivo, mas ela ainda não
-# persiste no Postgres (apenas processa).
 
 @app.post("/ingest-file")
 async def ingest_file(
@@ -76,7 +134,7 @@ async def ingest_file(
         graph_data = parser.parse(file.filename, content)
 
         # 2. Ingestão (Persistência no DB + Atualização da RAM)
-        # [MUDANÇA AQUI]: Chamamos o novo método do hybrid_recommender
+
         saved_count = recommender.ingest_data(graph_data)
 
         return {
